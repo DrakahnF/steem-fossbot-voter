@@ -9,8 +9,6 @@ const
   cookieParser = require('cookie-parser'),
   Cookies = require('cookies'),
   fs = require('fs'),
-  redis = require("redis"),
-  redisClient = require('redis').createClient(process.env.REDIS_URL),
   wait = require('wait.for'),
   extra = require('./extra.js'),
   moment_tz = require('moment-timezone'),
@@ -36,8 +34,6 @@ var
   html_editAlgo4 = "",
   html_testAlgo1 = "",
   html_testAlgo2 = "",
-  html_last_log1 = "",
-  html_last_log2 = "",
   html_stats1 = "",
   html_stats2 = "",
   html_stats3 = "",
@@ -55,7 +51,10 @@ var
 
 var
   html_msg_api_err_body = "API key was not correct.<br/>If you are the owner, please check or re-issue your key.<br/>If you do not have access to this service, please contact the owner.<br/><br/>You might need to supply your API key again in at the <a href=\"/\">Dashboard</a>",
-  html_msg_run_bot_body = "Bot successfully run.<br/>The votes will take a few seconds to be cast and registered on Steemit because of cast limiting.<br/>You can check the logs in a few minutes or wait for the email if you have set that up.";
+  html_msg_run_bot_body = "The processing and votes will take a few" +
+    " minutes to be cast and registered on Steemit because of the" +
+    " processing time and Steemit vote cast limiting.<br/>You can check" +
+    " the stats and logs in a few minutes to see the results.";
 
 var app = express();
 app.set('port', process.env.PORT || 5000);
@@ -72,15 +71,8 @@ app.use(expressSession({
 // Start server
 app.listen(app.get('port'), function() {
   console.log('Node app is running on port', app.get('port'));
-  lib.initSteem(function() {
-    if (!lib.hasFatalError()) {
-      console.log("Dashboard min requirements met, will be active on HTTPS");
-      loadFiles();
-    } else {
-      // kill node server to stop dashboard from showing and let owner know there is a problem without
-      // giving any information away
-      process.exit();
-    }
+  lib.initLib(false, function() {
+    loadFiles();
   });
 });
 
@@ -166,14 +158,6 @@ function loadFiles() {
   loadFileToString("/html/test-algo-part-2.html", function(str) {
     html_testAlgo2 = str;
     console.log("got /html/test-algo-part-2.html from file");
-  });
-  loadFileToString("/html/last-log-1.html", function(str) {
-    html_last_log1 = str;
-    console.log("got /html/last-log-1.html from file");
-  });
-  loadFileToString("/html/last-log-2.html", function(str) {
-    html_last_log2 = str;
-    console.log("got /html/last-log-2.html from file");
   });
   loadFileToString("/html/stats-1.html", function(str) {
     html_stats1 = str;
@@ -338,9 +322,9 @@ app.get("/stats", function(req, res) {
 });
 
 function execStats(req, res) {
-  lib.getPostsMetadataKeys(function(err, keys) {
+  lib.getPostsMetadataAllDates(function(err, dates) {
     var html = "";
-    if (err || keys == null || keys.length < 1) {
+    if (err || dates === null || dates.length < 1) {
       res.status(200).send(
         createMsgPageHTML("No stats available", "It looks like this is a fresh install of Voter. Please generate some stats by using it and then come back here to see the results in detail.")
       );
@@ -348,74 +332,64 @@ function execStats(req, res) {
       return;
     } else {
       var lastDay = -1;
-      for (var i = (keys.length - 1) ; i >= 0 ; i--) {
-        var dateTime = moment_tz.tz(keys[i].date, lib.getConfigVars().TIME_ZONE);
-        if (dateTime.date() != lastDay) {
+      for (var i = (dates.length - 1) ; i >= 0 ; i--) {
+        var dateTime = moment_tz.tz(Number(dates[i]), lib.getConfigVars().TIME_ZONE);
+        if (dateTime.date() !== lastDay) {
           lastDay = dateTime.date();
           // add spacer and then day over list item first
           html += "<li></li><li><a href=\"/stats?date_str="+dateTime.format("MM-DD-YYYY")+"\">"+
             "Votes for " + dateTime.format("MMM Do YYYY") + "</a></li>";
         }
-        html += "<li><a href=\"/stats?pd_key="+keys[i].key+"&time="+keys[i].date+"\">" +
+        html += "<li><a href=\"/stats?save_date="+dates[i]+"\">" +
           " --- --- " + dateTime.format("HH:mm") + "</a></li>";
       }
     }
     if (req.query.date_str) {
-      lib.getPersistentJson("daily_liked_posts", function(err, dailyLikedPostsResult) {
-        if (err === undefined || dailyLikedPostsResult === undefined || dailyLikedPostsResult == null) {
+      lib.getDailyLikedPosts(req.query.date_str, function(err, dailyLikedPostsResults) {
+        if (err) {
           res.status(200).send(
             createMsgPageHTML("Stats", "No data for daily liked posts, there may be an internal data inconsistency or corrupt key (err stage 1)"));
-          return;
-        }
-        var dailyLikedPosts = dailyLikedPostsResult.data;
-        var dailyLikedPostObj = null;
-        for (var i = 0 ; i < dailyLikedPosts.length ; i++) {
-          if (dailyLikedPosts[i].date_str.localeCompare(req.query.date_str) == 0) {
-            dailyLikedPostObj = dailyLikedPosts[i];
-          }
-        }
-        var thisDate = moment(req.query.date_str);
-        var html_header = "";
-        if (dailyLikedPostObj == null) {
-          // #58, no votes cast today, is not system failure, display meaningful message
-          html_header = "No votes cast on " + (thisDate.format("MMM Do YYYY"));
-          html_list = html_test_emptyList;
         } else {
-          html_header = "Votes cast on " + (thisDate.format("MMM Do YYYY"));
-          var postsMetadata = dailyLikedPostObj.posts;
-          var html_list = "";
-          if (postsMetadata.length > 0) {
-            for (var i = 0 ; i < postsMetadata.length ; i++) {
-              html_list += "<tr><td><a href=\""+postsMetadata[i].url+"\">"+postsMetadata[i].title+"</a></td><td>"+postsMetadata[i].score+"</td>"
-                + "<td>"+(postsMetadata[i].vote ? "YES" : "NO")+"</td></tr>";
-            }
-          } else {
+          var thisDate = moment(req.query.date_str); // TODO : fix this parsing, soon to be deprecated
+          var html_header = "";
+          if (dailyLikedPostsResults === null) {
+            // #58, no votes cast today, is not system failure, display meaningful message
+            html_header = "No votes cast on " + (thisDate.format("MMM Do YYYY"));
             html_list = html_test_emptyList;
+          } else {
+            html_header = "Votes cast on " + (thisDate.format("MMM Do YYYY"));
+            var postsMetadata = dailyLikedPostsResults.posts;
+            var html_list = "";
+            if (postsMetadata.length > 0) {
+              for (var i = 0 ; i < postsMetadata.length ; i++) {
+                html_list += "<tr><td><a href=\""+postsMetadata[i].url+"\">"+postsMetadata[i].title+"</a></td><td>"+postsMetadata[i].score+"</td>"
+                  + "<td>"+(postsMetadata[i].vote ? "YES" : "NO")+"</td></tr>";
+              }
+            } else {
+              html_list = html_test_emptyList;
+            }
           }
+          res.status(200).send(
+            html_stats_run1
+            + html
+            + html_stats_run2
+            + html_header
+            + html_stats_daily_likes_3
+            + html_list
+            + html_stats_daily_likes_4);
         }
-        res.status(200).send(
-          html_stats_run1
-          + html
-          + html_stats_run2
-          + html_header
-          + html_stats_daily_likes_3
-          + html_list
-          + html_stats_daily_likes_4);
       });
-    } else if (req.query.pd_key) {
-      redisClient.get(req.query.pd_key, function(err, postsMetadataStr) {
-        if (err || postsMetadataStr == null) {
-          handleErrorJson(res, "/stats-data-json Server error", "stats-data-json: key "+req.query.pd_key+" could not be fetched", 500);
+    } else if (req.query.save_date) {
+      lib.getPostsMetadataList(req.query.save_date, function(err, postsMetadataList) {
+        if (err || postsMetadataList === null) {
+          handleErrorJson(res, "/stats-data-json Server error", "stats-data-json: key "+req.query.save_date+" could not be fetched", 500);
           return;
         }
-        //console.log("/stats-data-json, for pd_key "+req.query.pd_key+", got object (as string): "+postsMetadata);
-        var postsMetadataObj = JSON.parse(postsMetadataStr);
-        var postsMetadata = postsMetadataObj.postsMetadata;
         var html_list = "";
-        if (postsMetadata.length > 0) {
-          for (var i = 0 ; i < postsMetadata.length ; i++) {
-            html_list += "<tr><td><a href=\""+postsMetadata[i].url+"\">"+postsMetadata[i].title+"</a></td><td>"+postsMetadata[i].score+"</td>"
-              + "<td>"+(postsMetadata[i].vote ? "YES" : "NO")+"</td></tr>";
+        if (postsMetadataList.length > 0) {
+          for (var i = 0 ; i < postsMetadataList.length ; i++) {
+            html_list += "<tr><td><a href=\""+postsMetadataList[i].url+"\">"+postsMetadataList[i].title+"</a></td><td>"+postsMetadataList[i].score+"</td>"
+              + "<td>"+(postsMetadataList[i].vote ? "YES" : "NO")+"</td></tr>";
           }
         } else {
           html_list = html_test_emptyList;
@@ -424,7 +398,7 @@ function execStats(req, res) {
           html_stats_run1
           + html
           + html_stats_run2
-          + "Bot run details for run at " + (moment_tz.tz(Number(req.query.time), lib.getConfigVars().TIME_ZONE).format("MMM Do YYYY HH:mm"))
+          + "Bot run details for run at " + (moment_tz.tz(Number(req.query.save_date), lib.getConfigVars().TIME_ZONE).format("MMM Do YYYY HH:mm"))
           + html_stats_run3
           + html_list
           + html_stats_run4);
@@ -444,43 +418,6 @@ function execStats(req, res) {
 /*
 * /stats
 */
-app.get("/last-log", function(req, res) {
-  console.log("req.query.api_key = "+req.query.api_key);
-  console.log("req.session.api_key = "+req.session.api_key);
-  if (req.query.api_key) {
-    req.session.api_key = req.query.api_key;
-    var cookies = new Cookies(req, res);
-    if (cookieSessionKey.length < 1) {
-      cookieSessionKey = extra.calcMD5("" + (Math.random() * 7919));
-    }
-    console.log("created session_key cookie for client: "+cookieSessionKey);
-    cookies.set("session_key", cookieSessionKey, {overwrite: true, httpOnly: false});
-    console.log("check cookie for session_key: "+cookies.get("session_key"));
-  } else if (!req.session.api_key) {
-    handleError(res, "/stats Unauthorized", "stats: session is invalid (no session key), please restart from Dashboard", 401);
-    return;
-  } else if (req.session.api_key.localeCompare(process.env.BOT_API_KEY) != 0) {
-    handleError(res, "/stats Unauthorized", "stats: session is invalid (out of date session key), please restart from Dashboard", 401);
-    return;
-  }
-  lib.getPersistentString("last_log_html", function(err, logs) {
-    if (err !== undefined || logs == null) {
-      var html_logs = createMsgPageHTML("Last log", "No logs yet, please run bot for first time!");
-      res.status(200).send(html_logs);
-      return;
-    }
-    saveStringToFile("public/tmp-stats.html", logs, function(err) {
-      if (err) {
-        handleError(res, "can't save temp file", "/last-log: can't save temp file", 500);
-      } else {
-        res.status(200).send(
-          html_last_log1 
-          + "/tmp-stats.html"
-          + html_last_log2);
-      }
-    });
-  });
-});
 
 app.get("/stats-data-json", function(req, res) {
   if (!req.query.api_key && !req.query.session_key) {
@@ -493,82 +430,32 @@ app.get("/stats-data-json", function(req, res) {
     handleError(res, "/stats-data-json Unauthorized", "stats-data-json: session_key invalid", 401);
     return;
   }
-  if (req.query.pd_key) {
-    redisClient.get(req.query.pd_key, function(err, postsMetadata) {
-      if (err || postsMetadata == null) {
-        handleErrorJson(res, "/stats-data-json Server error", "stats-data-json: key "+req.query.pd_key+" could not be fetched", 500);
+  if (req.query.save_date) {
+    lib.getPostsMetadataList(req.query.save_date, function(err, postsMetadataList) {
+      if (err || postsMetadataList === undefined || postsMetadataList === null) {
+        handleErrorJson(res, "/stats-data-json Server error", "stats-data-json: key "+req.query.save_date+" could not be fetched", 500);
         return;
       }
-      //console.log("/stats-data-json, for pd_key "+req.query.pd_key+", got object (as string): "+postsMetadata);
-      var postsMetadataObj = JSON.parse(postsMetadata);
-      res.json(postsMetadataObj);
-      return;
+      res.json({list: postsMetadataList});
     });
     return;
-  }
-  lib.getPostsMetadataKeys(function(err, keys) {
-    if (err) {
-      handleErrorJson(res, "/stats-data-json Server error", "stats-data-json: no data in store, no keys", 500);
-      return;
-    }
-    console.log(" - /stats-data-json got keys: "+JSON.stringify(keys));
-    if (req.query.count_only) {
-      res.json({num_keys: keys.length});
-      return;
-    }
-    var justKeys = [];
-    for (var i = 0 ; i < keys.length ; i++) {
-      justKeys.push(keys[i].key);
-    }
-    recursiveGetPostsMetadata(justKeys, 0, function(resultList) {
-      if (resultList == null || resultList.length < 1) {
-        handleErrorJson(res, "/stats-data-json Server error", "stats-data-json: error fetching data, no results for key fetch", 500);
-      } else {
-        var postsMetadataList = [];
-        if (justKeys.length > 1) {
-          var limit = resultList.length;
-          if (req.query.limit) {
-            limit = req.query.limit;
-            if (limit < 1) {
-              limit = 1;
-            }
-            if (limit > resultList.length) {
-              limit = resultList.length;
-            }
-          }
-          console.log("get num keys: "+limit+" of "+resultList.length);
-          for (var i = 0 ; i < limit ; i++) {
-            postsMetadataList.push(JSON.parse(resultList[i]));
-          }
-        } else {
-          postsMetadataList.push(JSON.parse(resultList));
-        }
-        if (req.query.summary) {
-          var summary = [];
-          for (var i = 0 ; i < postsMetadataList.length ; i++) {
-            var numVotes = 0;
-            for (var j = 0 ; j < postsMetadataList[i].postsMetadata.length ; j++) {
-              if (postsMetadataList[i].postsMetadata[j].vote) {
-                numVotes++;
-              }
-            }
-            var dateTime = moment_tz.tz(keys[i].date, lib.getConfigVars().TIME_ZONE);
-            summary.push({
-              date: keys[i].date,
-              date_str: (dateTime.format("MM/DD/YY HH:mm")),
-              date_day: dateTime.date(),
-              num_posts: postsMetadataList[i].postsMetadata.length,
-              num_votes: numVotes
-            });
-          }
-          console.log("Sending summary: "+JSON.stringify(summary));
-          res.json({summary: summary});
-        } else {
-          res.json({postsMetadataList: postsMetadataList});
-        }
+  } else if (req.query.summary) {
+    lib.getPostsMetadataSummary(function (summary) {
+      console.log("Sending summary: "+JSON.stringify(summary));
+      res.json({summary: summary});
+    });
+  } else if (req.query.count_only) {
+    lib.getPostsMetadataAllDates(function(err, dates) {
+      if (err || dates === undefined || dates === null) {
+        handleErrorJson(res, "/stats-data-json Server error", "stats-data-json: no data in store, no keys", 500);
+        return;
       }
-    }, []);
-  });
+      console.log(" - /stats-data-json dates: "+JSON.stringify(dates));
+      res.json({num_keys: dates.length});
+    });
+  } else {
+    handleErrorJson(res, "/stats-data-json Server error", "stats-data-json: no query", 500);
+  }
 });
 
 app.get("/get-config-vars", function(req, res) {
@@ -582,9 +469,12 @@ app.get("/get-config-vars", function(req, res) {
     handleErrorJson(res, "/stats-data-json Unauthorized", "stats-data-json: session_key invalid", 401, "3");
     return;
   }
-  res.json(lib.getConfigVars());
+  var config = lib.getConfigVars();
+  delete config["_id"];
+  res.json(config);
 });
 
+/*
 function recursiveGetPostsMetadata(keys, index, callback, list) {
   redisClient.get(keys[index], function(err, result) {
     index++;
@@ -600,6 +490,7 @@ function recursiveGetPostsMetadata(keys, index, callback, list) {
     }
   });
 }
+*/
 
 
 app.get("/get-algo", function(req, res) {
@@ -613,11 +504,12 @@ app.get("/get-algo", function(req, res) {
     handleError(res, "/stats-data-json Unauthorized", "stats-data-json: session_key invalid", 401);
     return;
   }
-  lib.getPersistentJson("algorithm", function(err, algorithm) {
+  lib.getPersistentObj(lib.DB_ALGORITHM, function(err, algorithm) {
     console.log("attempted to get algorithm: "+algorithm);
     if (algorithm != null) {
+      delete algorithm["_id"];
       res.json(JSON.stringify(algorithm));
-    } else if (err === undefined || algorithm === undefined || algorithm == null) {
+    } else if (err || algorithm === undefined || algorithm === null) {
       handleErrorJson(res, "/get-algo Server error", "get-algo: no data in store", 500);
     }
   });
@@ -634,22 +526,17 @@ app.get("/get-daily-liked-posts", function(req, res) {
     handleError(res, "/get-daily-liked-posts Unauthorized", "get-daily-liked-posts: session_key invalid", 401);
     return;
   }
-  lib.getPersistentJson("daily_liked_posts", function(err, dailyLikedPostsResults) {
-    if (err === undefined || dailyLikedPostsResults == null) {
+  var query = null;
+  if (req.query.date_str) {
+    query = req.query.date_str;
+  }
+  lib.getDailyLikedPosts(query, function(err, dailyLikedPostsResults) {
+    if (err
+        || dailyLikedPostsResults === undefined
+        || dailyLikedPostsResults === null) {
       handleErrorJson(res, "/get-daily-liked-posts Server error", "get-daily-liked-posts: no data in store", 500);
-      return;
-    }
-    console.log("got daily_liked_posts");
-    if (req.query.date_str) {
-      var dailyLikedPosts = dailyLikedPostsResults.data;
-      for (var i = 0 ; i < dailyLikedPosts.length ; i++) {
-        if (dailyLikedPosts[i].date_str.localeCompare(req.query.date_str) == 0) {
-          res.json(dailyLikedPosts[i]);
-          return;
-        }
-      }
-      handleErrorJson(res, "/get-daily-liked-posts Server error", "get-daily-liked-posts: can't find daily liked posts with date string "+req.query.date_str, 500);
     } else {
+      console.log("got daily_liked_posts");
       res.json(dailyLikedPostsResults);
     }
   });
@@ -684,41 +571,18 @@ app.get("/run-bot", function(req, res) {
     handleError(res, "/stats Unauthorized", "stats: session is invalid (out of date session key), please restart from Dashboard", 401);
     return;
   }
-  lib.getPersistentJson("algorithm", function(err, algo) {
-    if (err === undefined || algo == null) {
+  lib.getPersistentObj(lib.DB_ALGORITHM, function(err, algo) {
+    if (err || algo === null) {
       res.status(200).send(
         createMsgPageHTML("Run Bot", "Algorithm is not yet set!<br/>Go to <strong>Edit Algo</strong> from the dashboard to create it."));
       return;
     }
-    lib.runBot(function(obj) {
-      //console.log("lib.runBot returned: " + JSON.stringify(obj));
-      if (obj) {
-        if (req.query.json) {
-          // return json directly
-          res.status(obj.status).json(obj);
-        } else {
-          // default to show in logs (same as /stats endpoint)
-          lib.getPersistentString("last_log_html", function(err, logs) {
-            var html_logs = "<html><body><h1>No logs yet, please run bot for first time!</h1></body></html>";
-            if (logs != null) {
-              html_logs = logs;
-            }
-            saveStringToFile("public/tmp-stats.html", html_logs, function(err) {
-              if (err) {
-                handleError(res, "can't save temp file", "/stats: can't save temp file", 500);
-              } else {
-                // #2, redirect to stats page instead
-                execStats(req, res);
-                //res.status(200).send(
-                //  createMsgPageHTML("Run bot success", html_msg_run_bot_body));
-              }
-            });
-          });
-        }
-      } else {
-        handleError(res, "/run-bot Internal error", "Run bot: Bot run failed internally, consult logs", 500);
-      }
-    });
+    // #86, fork this process to start bot via bot.js, same as scheduled
+    // method
+    var fork = require('child_process').fork;
+    var child = fork('./bot.js');
+    res.status(200).send(
+      createMsgPageHTML("Bot script started.", html_msg_run_bot_body));
   });
 });
 
@@ -746,7 +610,7 @@ app.get("/edit-algo", function(req, res) {
     lib.deleteWeightMetric(req.query.delete, process.env.BOT_API_KEY, function(result) {
       console.log("lib.deleteWeightMetric result: "+JSON.stringify(result));
       // show edit-algo as normal
-      editAlgoExec(res, "<h2 class=\"sub-header\">"+result.message+"</h2>");  
+      editAlgoExec(res, "<h2 class=\"sub-header\">"+result.message+"</h2>");
     });
     return;
   }
@@ -782,11 +646,11 @@ app.get("/edit-algo", function(req, res) {
     lib.updateMetricList(str, contents, process.env.BOT_API_KEY, function(result) {
       console.log("lib.updateMetricList result: "+JSON.stringify(result));
       // show edit-algo as normal
-      editAlgoExec(res, "<h2 class=\"sub-header\">"+result.message+"</h2>");  
+      editAlgoExec(res, "<h2 class=\"sub-header\">"+result.message+"</h2>");
     });
     return;
   }
-  editAlgoExec(res);  
+  editAlgoExec(res);
 });
 
 // POST /edit-algo
@@ -852,13 +716,13 @@ app.post("/edit-algo", bodyParser.urlencoded({extended: false}), function(req, r
       return;
     }
     console.log(" - update algorithm");
-    lib.persistJson("algorithm", JSON.parse(req.body.json_algo), function(err) {
-      if (err !== undefined) {
+    lib.persistObj(lib.DB_ALGORITHM, JSON.parse(req.body.json_algo), function(err) {
+      if (err) {
         console.log(" - - ERROR SAVING algorithm");
         // TODO : show this on page
       }
     });
-    editAlgoExec(res, "<h2 class=\"sub-header\">Imported algorithm</h2>");  
+    editAlgoExec(res, "<h2 class=\"sub-header\">Imported algorithm</h2>");
     return;
   }
   // create query
@@ -876,18 +740,15 @@ app.post("/edit-algo", bodyParser.urlencoded({extended: false}), function(req, r
   lib.updateWeightMetric(query, process.env.BOT_API_KEY, function(result) {
     console.log("lib.updateWeightMetric result: "+JSON.stringify(result));
     // show edit-algo as normal
-    editAlgoExec(res, "<h2 class=\"sub-header\">"+result.message+"</h2>");  
+    editAlgoExec(res, "<h2 class=\"sub-header\">"+result.message+"</h2>");
   });
 });
 
 function editAlgoExec(res, message) {
-  lib.getPersistentJson("algorithm", function(err, algorithmResult) {
+  lib.getPersistentObj(lib.DB_ALGORITHM, function(err, algorithmResult) {
     var algorithm = {};
-    if (algorithmResult != null) {
-      algorithm = algorithmResult;
-      console.log(" - got algorithm from redis store: "+JSON.stringify(algorithm));
-    } else if (err !== undefined || algorithmResult === undefined || algorithmResult == null) {
-      console.log(" - no algorithm in redis store, USING DEFAULT");
+    if (err || algorithmResult === undefined || algorithmResult === null) {
+      console.log(" - no algorithm in db, USING DEFAULT");
       // TODO : remove this default algorithm setting
       algorithm = {
         weights: [],
@@ -900,6 +761,9 @@ function editAlgoExec(res, message) {
         domainWhitelist: [],
         domainBlacklist: []
       };
+    } else {
+      algorithm = algorithmResult;
+      console.log(" - got algorithm from db: "+JSON.stringify(algorithm));
     }
     var html_whiteblacklists = "";
     //author_whitelist
@@ -1071,10 +935,12 @@ app.post("/test-algo", bodyParser.urlencoded({extended: false}), function(req, r
 
 function testAlgoExec(res, options) {
   lib.runBot(function(obj) {
-    console.log("lib.runBot returned: " + JSON.stringify(obj));
     var postsMetadata = [];
-    if (obj && obj.status == 200) {
-      postsMetadata = obj.posts;
+    if (obj !== undefined && obj !== null) {
+      postsMetadata = obj;
+      console.log("lib.runBot returned valid results");
+    } else {
+      console.log("lib.runBot returned invalid results");
     }
     // build list
     var html_list = "";
@@ -1106,10 +972,6 @@ app.get("/edit-config", function(req, res) {
     html_title += "Updated MIN_POST_AGE_TO_CONSIDER";
   } else if (req.query.MAX_POST_TO_READ) {
     configVars.MAX_POST_TO_READ = Number(atob(req.query.MAX_POST_TO_READ));
-    change = true;
-    html_title += "Updated MAX_POST_TO_READ";
-  } else if (req.query.EMAIL_DIGEST) {
-    configVars.EMAIL_DIGEST = Number(atob(req.query.EMAIL_DIGEST));
     change = true;
     html_title += "Updated MAX_POST_TO_READ";
   } else if (req.query.MIN_WORDS_FOR_ARTICLE) {
@@ -1211,19 +1073,29 @@ app.post("/edit-config", bodyParser.urlencoded({extended: false}), function(req,
     handleError(res, "/stats Internal Server Error", "edit-config: updated config var object could not be read", 500);
     return;
   }
+  // deprecated
   if (newConfigVars.MAX_VOTES_IN_24_HOURS !== undefined) {
     // nothing
   }
+  // active
   if (newConfigVars.MIN_POST_AGE_TO_CONSIDER !== undefined) {
     configVars.MIN_POST_AGE_TO_CONSIDER = newConfigVars.MIN_POST_AGE_TO_CONSIDER;
     change = true;
   }
-  if (newConfigVars.MAX_POST_TO_READ !== undefined) {
-    configVars.MAX_POST_TO_READ = newConfigVars.MAX_POST_TO_READ;
+  if (newConfigVars.TIME_ZONE !== undefined) {
+    configVars.TIME_ZONE = newConfigVars.TIME_ZONE;
     change = true;
   }
-  if (newConfigVars.EMAIL_DIGEST !== undefined) {
-    configVars.EMAIL_DIGEST = newConfigVars.EMAIL_DIGEST;
+  if (newConfigVars.MIN_VOTING_POWER !== undefined) {
+    configVars.MIN_VOTING_POWER = newConfigVars.MIN_VOTING_POWER;
+    change = true;
+  }
+  if (newConfigVars.VOTE_VOTING_POWER !== undefined) {
+    configVars.VOTE_VOTING_POWER = newConfigVars.VOTE_VOTING_POWER;
+    change = true;
+  }
+  if (newConfigVars.MAX_POST_TO_READ !== undefined) {
+    configVars.MAX_POST_TO_READ = newConfigVars.MAX_POST_TO_READ;
     change = true;
   }
   if (newConfigVars.MIN_WORDS_FOR_ARTICLE !== undefined) {
@@ -1260,10 +1132,6 @@ app.post("/edit-config", bodyParser.urlencoded({extended: false}), function(req,
   }
   if (newConfigVars.MIN_LANGUAGE_USAGE_PC !== undefined) {
     configVars.MIN_LANGUAGE_USAGE_PC = newConfigVars.MIN_LANGUAGE_USAGE_PC;
-    change = true;
-  }
-  if (newConfigVars.TIME_ZONE !== undefined) {
-    configVars.TIME_ZONE = newConfigVars.TIME_ZONE;
     change = true;
   }
   if (newConfigVars.MIN_KEYWORD_FREQ) {
